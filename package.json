@@ -1,0 +1,106 @@
+import { chromium } from "playwright";
+import fs from "fs";
+
+const URL = "https://pizzaboys.com/menu/";
+
+function looksLikePrice(s) {
+  // adjust if you use TT$ or other format
+  return /\$|TT\$|USD|\d+\.\d{2}/i.test(s);
+}
+
+(async () => {
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage({
+    userAgent:
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+  });
+
+  await page.goto(URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+
+  // Wait for dynamic menu to render.
+  // This is a robust fallback: wait until there are multiple "buttons" with meaningful text.
+  await page.waitForTimeout(3000);
+
+  // Try a few times to allow JS menu to populate
+  for (let i = 0; i < 10; i++) {
+    const count = await page.evaluate(() => {
+      const btns = Array.from(document.querySelectorAll("button"));
+      return btns.filter(b => (b.innerText || "").trim().length > 10).length;
+    });
+    if (count > 10) break;
+    await page.waitForTimeout(1500);
+  }
+
+  // Pull candidate item blocks from buttons/cards
+  const rawBlocks = await page.evaluate(() => {
+    const blocks = [];
+    const btns = Array.from(document.querySelectorAll("button"));
+    for (const b of btns) {
+      const t = (b.innerText || "").replace(/\s+\n/g, "\n").trim();
+      if (t.length > 10) blocks.push(t);
+    }
+    return blocks;
+  });
+
+  // Dedupe + keep only blocks that look like menu entries (usually have prices)
+  const seen = new Set();
+  const blocks = [];
+  for (const b of rawBlocks) {
+    const oneLine = b.replace(/\n+/g, " | ").trim();
+    if (!oneLine) continue;
+    if (seen.has(oneLine)) continue;
+    seen.add(oneLine);
+    blocks.push(b);
+  }
+
+  // Keep anything with a price OR anything that appears frequently near priced items
+  const menuLines = blocks
+    .map(b => b.split("\n").map(x => x.trim()).filter(Boolean))
+    .flat()
+    .filter(line => line.length > 2);
+
+  // Light cleanup: remove obvious non-menu UI lines
+  const blacklist = [
+    "Create Your Own",
+    "Checkout",
+    "Cart",
+    "Add",
+    "Remove",
+    "Sign in",
+    "Log in"
+  ];
+
+  const cleaned = menuLines.filter(line => {
+    if (blacklist.some(x => line.toLowerCase().includes(x.toLowerCase()))) return false;
+    // Keep if it contains a price OR is a plausible item name near prices
+    return looksLikePrice(line) || line.length >= 4;
+  });
+
+  // Make a simple HTML page that Intercom can ingest
+  const updatedAt = new Date().toISOString();
+  const html = `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Pizza Boys Menu (AI)</title>
+  <meta name="robots" content="noindex" />
+  <style>
+    body{font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial; padding:24px; line-height:1.4;}
+    h1{margin:0 0 8px;}
+    .meta{color:#666; margin-bottom:16px;}
+    pre{white-space:pre-wrap; background:#f6f6f6; padding:16px; border-radius:12px;}
+  </style>
+</head>
+<body>
+  <h1>Pizza Boys Menu</h1>
+  <div class="meta">Source: <a href="${URL}">${URL}</a><br/>Updated: ${updatedAt}</div>
+  <pre>${cleaned.join("\n")}</pre>
+</body>
+</html>`;
+
+  fs.mkdirSync("public", { recursive: true });
+  fs.writeFileSync("public/index.html", html, "utf8");
+
+  await browser.close();
+  console.log(`Wrote public/index.html with ${cleaned.length} lines`);
+})();
